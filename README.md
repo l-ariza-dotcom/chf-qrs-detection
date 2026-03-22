@@ -5,11 +5,11 @@
 [![PhysioNet](https://img.shields.io/badge/Dataset-PhysioNet%20BIDMC--CHF-lightblue)](https://physionet.org/content/chfdb/1.0.0/)
 [![Status](https://img.shields.io/badge/Status-Research%20v12-orange)]()
 
-> **Associated paper:** *Comparative Analysis of Machine Learning Models for Congestive Heart Failure Detection from QRS Complex* — Ing. Adriel Lariza Lozada Romero
+> **Associated paper:** *Comparative Analysis of Machine Learning Models for Congestive Heart Failure Detection from QRS Complex*
 
 ---
 
-## 📋 Overview
+##  Overview
 
 This repository provides the full reproducible pipeline (`v12`) for **beat-level binary classification** of Congestive Heart Failure (CHF) morphology from single-lead ECG signals. Individual cardiac beats are segmented around R-peaks, handcrafted morphological features are extracted, and five classifiers are benchmarked under identical conditions.
 
@@ -29,7 +29,7 @@ This repository provides the full reproducible pipeline (`v12`) for **beat-level
 
 ---
 
-## 🗂️ Repository Structure
+##  Repository Structure
 
 ```
 chf-qrs-detection/
@@ -56,7 +56,7 @@ chf-qrs-detection/
 
 ---
 
-## ⚙️ Installation
+##  Installation
 
 ### 1. Clone the repository
 
@@ -81,7 +81,7 @@ python setup.py
 
 This will automatically detect whether `pip` or `conda` is available and install all required packages. At the end, it prints download instructions for the dataset.
 
-> ⚠️ **Restart your kernel/environment** after setup before running `chf_detection.py`.
+>  **Restart your kernel/environment** after setup before running `chf_detection.py`.
 
 ### Dependencies installed
 
@@ -99,7 +99,7 @@ This will automatically detect whether `pip` or `conda` is available and install
 
 ---
 
-## 📦 Dataset
+##  Dataset
 
 This project uses the **BIDMC Congestive Heart Failure Database**, freely available on PhysioNet.
 
@@ -114,7 +114,7 @@ Or download manually from: [https://physionet.org/content/chfdb/1.0.0/](https://
 
 ---
 
-## 🚀 Running the Pipeline
+##  Running the Pipeline
 
 ### 1. Configure paths
 
@@ -145,11 +145,11 @@ An **interactive menu** will appear:
 ──────────────────────────────────────────────────────────────
 ```
 
-> 💡 Start with **option 1** to verify your installation before running the full pipeline.
+>  Start with **option 1** to verify your installation before running the full pipeline.
 
 ---
 
-## 🔬 Signal Processing & Feature Extraction
+##  Signal Processing & Feature Extraction
 
 Each ECG record is processed as follows:
 
@@ -161,7 +161,7 @@ Each ECG record is processed as follows:
 
 ---
 
-## ⚖️ Class Balancing
+##  Class Balancing
 
 Applied **only to the training set** (no data leakage):
 
@@ -170,7 +170,7 @@ Applied **only to the training set** (no data leakage):
 
 ---
 
-## 📊 Outputs
+##  Outputs
 
 | File | Description |
 |---|---|
@@ -188,7 +188,7 @@ Applied **only to the training set** (no data leakage):
 
 ---
 
-## 🔁 Reproducibility
+##  Reproducibility
 
 All stochastic components use `random_state=42`. The full configuration is logged automatically to `reports/reproducibility_config.json` at the end of each run.
 
@@ -198,7 +198,7 @@ LOSO (Leave-One-Subject-Out) cross-validation is available via **option 4** of t
 
 ---
 
-## 📄 Citation
+##  Citation
 
 If you use this code in your research, please cite:
 
@@ -206,21 +206,21 @@ If you use this code in your research, please cite:
 @article{lariza2025chf,
   title   = {Comparative Analysis of Machine Learning Models for
              Congestive Heart Failure Detection from QRS Complex},
-  author  = {Lariza Lozada Romero, Adriel},
-  journal = {[Journal / Conference Name]},
-  year    = {2025},
+  author  = {A.L. Lozada-Romero, R. Ramírez-Villalobos, L. Trujillo, J.R. Cárdenas-Valdez},
+  journal = {[MDPI / TBD]},
+  year    = {2026},
 }
 ```
 
 ---
 
-## 📜 License
+##  License
 
 This project is licensed under the **MIT License** — see the [LICENSE](LICENSE) file for details.
 
 ---
 
-## 🤝 Contact
+##  Contact
 
 **Ing. Adriel Lariza Lozada Romero** — [@l-ariza-dotcom](https://github.com/l-ariza-dotcom)
 
