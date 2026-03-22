@@ -1,0 +1,47 @@
+# ── Dataset (do NOT upload PhysioNet data) ────────────────────
+data/
+*.dat
+*.hea
+*.ecg
+*.atr
+
+# ── Generated results ──────────────────────────────────────────
+results/
+outputs/
+version_12/
+
+# ── Trained models ─────────────────────────────────────────────
+*.pkl
+*.joblib
+*.h5
+*.keras
+
+# ── Python cache ───────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual environments ───────────────────────────────────────
+venv/
+env/
+.venv/
+.env/
+
+# ── Jupyter Notebooks checkpoints ─────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Spyder project files ───────────────────────────────────────
+.spyderproject.cfg
+.spyproject/
+
+# ── OS files ───────────────────────────────────────────────────
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ── Logs ───────────────────────────────────────────────────────
+*.log
+*.csv~
