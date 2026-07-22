@@ -217,6 +217,140 @@ class CHFDetectionV12:
     def preprocess_signal(self, sig):
         return self._normalize(self._bandpass(sig)).astype(np.float32)
 
+    def _pan_tompkins_rpeaks(self, sig, fs=None):
+        """
+        Detector de picos R basado en el algoritmo de Pan-Tompkins (1985).
+        Implementación práctica de las cinco etapas clásicas: filtrado
+        pasa-banda (5-15 Hz, donde se concentra la energía del complejo QRS),
+        derivación, elevación al cuadrado, integración por ventana móvil
+        (~150 ms) y umbralización adaptativa con periodo refractario (~200 ms).
+
+        Esta función es independiente de las anotaciones distribuidas por
+        PhysioNet — se utiliza únicamente para fines de validación cruzada
+        del detector (ver `validate_pan_tompkins_detection`), no para generar
+        las ventanas QRS empleadas en la clasificación (que continúan
+        basándose en `ann.sample`, ver `cache_features_per_record`).
+
+        Devuelve un arreglo de índices (muestras) de los picos R detectados.
+        """
+        if fs is None: fs = self.fs
+        sig = np.asarray(sig, dtype=np.float64)
+        nyq = fs / 2.0
+
+        # 1) Filtro pasa-banda 5-15 Hz
+        b, a = scipy_signal.butter(2, [5/nyq, 15/nyq], btype="band")
+        filtered = scipy_signal.filtfilt(b, a, sig)
+
+        # 2) Derivada
+        derivative = np.diff(filtered, prepend=filtered[0])
+
+        # 3) Elevación al cuadrado
+        squared = derivative ** 2
+
+        # 4) Integración por ventana móvil (~150 ms)
+        win_size = max(1, int(round(0.150 * fs)))
+        integrated = np.convolve(squared, np.ones(win_size)/win_size, mode="same")
+
+        # 5) Umbralización adaptativa con periodo refractario (~200 ms)
+        refractory = max(1, int(round(0.200 * fs)))
+        learning = int(round(2 * fs))  # primeros ~2s para inicializar umbrales
+        spki = npki = threshold1 = 0.0
+        if len(integrated) > learning:
+            spki = float(np.max(integrated[:learning])) * 0.25
+            npki = float(np.mean(integrated[:learning])) * 0.5
+            threshold1 = npki + 0.25 * (spki - npki)
+
+        peaks = []
+        i = 0
+        last_peak = -refractory
+        n = len(integrated)
+        while i < n:
+            if integrated[i] > threshold1 and (i - last_peak) > refractory:
+                w0, w1 = max(0, i - refractory // 2), min(n, i + refractory // 2)
+                local_idx = w0 + int(np.argmax(integrated[w0:w1]))
+                peaks.append(local_idx)
+                last_peak = local_idx
+                spki = 0.125 * integrated[local_idx] + 0.875 * spki
+                i = local_idx + refractory
+            else:
+                npki = 0.125 * integrated[i] + 0.875 * npki
+                i += 1
+            threshold1 = npki + 0.25 * (spki - npki)
+
+        return np.array(sorted(set(peaks)), dtype=int)
+
+    def validate_pan_tompkins_detection(self, max_records=None, tolerance_ms=50):
+        """
+        Valida el detector Pan-Tompkins implementado en este trabajo frente a
+        las anotaciones de referencia (`ann.sample`) distribuidas por
+        PhysioNet para BIDMC-CHF. Un pico detectado se considera verdadero
+        positivo si cae dentro de una ventana de tolerancia (±tolerance_ms)
+        alrededor de un pico anotado, sin reasignar un mismo pico anotado dos
+        veces. Calcula, por registro y en agregado: sensibilidad, valor
+        predictivo positivo (PPV), F1 y error de temporización promedio (ms).
+
+        """
+        records = self.list_records()
+        if max_records: records = records[:max_records]
+        tol = max(1, int(round(tolerance_ms/1000*self.fs)))
+        rows = []
+        _section(f"[PT-Validation] Pan-Tompkins vs anotaciones WFDB — "
+                  f"{len(records)} registros | tolerancia=±{tolerance_ms}ms")
+        for i, r in enumerate(records, 1):
+            try:
+                rec, ann = self._load_record(r)
+                sig = rec.p_signal[:, 0]
+                ref_peaks = np.asarray(ann.sample)
+                pt_peaks = self._pan_tompkins_rpeaks(sig, self.fs)
+
+                matched_ref = np.zeros(len(ref_peaks), dtype=bool)
+                tp, errors = 0, []
+                for p in pt_peaks:
+                    if len(ref_peaks) == 0: break
+                    diffs = np.abs(ref_peaks - p)
+                    j = int(np.argmin(diffs))
+                    if diffs[j] <= tol and not matched_ref[j]:
+                        matched_ref[j] = True
+                        tp += 1
+                        errors.append(float(diffs[j]) / self.fs * 1000)
+
+                fn = int(np.sum(~matched_ref))
+                fp = int(len(pt_peaks) - tp)
+                sens = tp/(tp+fn) if (tp+fn) > 0 else np.nan
+                ppv  = tp/(tp+fp) if (tp+fp) > 0 else np.nan
+                f1   = (2*sens*ppv/(sens+ppv)) if (sens and ppv and (sens+ppv) > 0) else np.nan
+                mean_err = float(np.mean(errors)) if errors else np.nan
+
+                rows.append({"record": r, "n_ref_peaks": len(ref_peaks),
+                             "n_pt_peaks": len(pt_peaks), "tp": tp, "fp": fp, "fn": fn,
+                             "sensitivity": sens, "ppv": ppv, "f1": f1,
+                             "mean_timing_error_ms": mean_err})
+                print(f"  [{i:2d}/{len(records)}] {r}  sens={sens:.3f}  ppv={ppv:.3f}  "
+                      f"f1={f1:.3f}  err={mean_err:.1f}ms  (ref={len(ref_peaks)}, pt={len(pt_peaks)})")
+            except Exception as e:
+                print(f"  [{i:2d}/{len(records)}] {r}  ⚠️  {e}")
+
+        df = pd.DataFrame(rows)
+        out_path = self.paths.reports_dir / "pantompkins_validation.csv"
+        df.to_csv(out_path, index=False)
+
+        if len(df):
+            summary = {
+                "mean_sensitivity": float(df["sensitivity"].mean(skipna=True)),
+                "mean_ppv": float(df["ppv"].mean(skipna=True)),
+                "mean_f1": float(df["f1"].mean(skipna=True)),
+                "mean_timing_error_ms": float(df["mean_timing_error_ms"].mean(skipna=True)),
+                "n_records": int(len(df)),
+                "tolerance_ms": tolerance_ms,
+            }
+            with open(self.paths.reports_dir / "pantompkins_validation_summary.json", "w") as f:
+                json.dump(summary, f, indent=2)
+            print(f"\n  ✅ Resumen global ({summary['n_records']} registros): "
+                  f"sens={summary['mean_sensitivity']:.3f}  ppv={summary['mean_ppv']:.3f}  "
+                  f"f1={summary['mean_f1']:.3f}  err={summary['mean_timing_error_ms']:.1f}ms")
+            print(f"  📄 {out_path}")
+        return df
+
     def _extract_features(self, beat):
         f = [np.mean(beat),np.std(beat),float(skew(beat)),float(kurtosis(beat)),
              np.max(beat),np.min(beat),np.ptp(beat)]
@@ -255,7 +389,7 @@ class CHFDetectionV12:
                 rec,ann = self._load_record(r)
                 sig = self.preprocess_signal(rec.p_signal)
                 del rec; gc.collect()
-                half = self.half; X_list,y_list = [],[]
+                half = self.half; X_list,y_list,raw_list = [],[],[]
                 for peak,lab in zip(ann.sample,ann.symbol):
                     if len(X_list)>=max_beats_per_record: break
                     s,e = peak-half, peak+half
@@ -263,11 +397,16 @@ class CHFDetectionV12:
                     beat = sig[s:e,0]
                     if len(beat)!=self.window_size: continue
                     X_list.append(self._extract_features(beat)); y_list.append(lab)
+                    raw_list.append(beat.astype(np.float32))
                 _free_mem(sig)
                 if not X_list: print("    no beats"); continue
+                # X: 18 engineered features (tree-based models). X_raw: 300-sample
+                # raw QRS-centered window, used by the raw-signal models (1D CNN,
+                # MiniRocket) 
                 np.savez_compressed(npz, X=np.vstack(X_list).astype(np.float32),
+                                    X_raw=np.vstack(raw_list).astype(np.float32),
                                     y=np.array(y_list), record=r)
-                _free_mem(X_list, y_list)
+                _free_mem(X_list, y_list, raw_list)
                 print(f"  ✅ {len(y_list)} beats"); _print_ram()
             except Exception as e:
                 print(f"\n    ⚠️  {e}"); gc.collect()
@@ -277,18 +416,31 @@ class CHFDetectionV12:
         files = sorted(self.paths.cache_dir.glob("*_features.npz"))
         if not files: raise FileNotFoundError("Sin cache.")
         _section(f"[2/5] loading dataset — {len(files)} records")
-        X_all,y_all,g_all = [],[],[]
+        X_all,Xraw_all,y_all,g_all = [],[],[],[]
         total = 0
         for f in files:
             if max_beats_total and total>=max_beats_total: break
-            d=np.load(f,allow_pickle=True); X_f=d["X"].astype(np.float32); y_f=d["y"]; rec=str(d["record"]); d.close()
+            d=np.load(f,allow_pickle=True)
+            X_f=d["X"].astype(np.float32); y_f=d["y"]; rec=str(d["record"])
+            if "X_raw" not in d.files:
+                raise KeyError(
+                    f"'{f.name}' no tiene la señal cruda cacheada (clave 'X_raw'). "
+                    "Este cache fue generado con una versión anterior del pipeline "
+                    "(solo features, sin señal cruda para CNN/MiniRocket). "
+                    "Borra la carpeta cache_records y vuelve a correr para regenerarlo."
+                )
+            Xraw_f = d["X_raw"].astype(np.float32)
+            d.close()
             if max_beats_total and total+len(X_f)>max_beats_total:
-                keep=max_beats_total-total; X_f,y_f=X_f[:keep],y_f[:keep]
-            X_all.append(X_f); y_all.append(y_f); g_all.append(np.full(len(y_f),rec)); total+=len(y_f)
-        X=np.vstack(X_all).astype(np.float32); y=np.hstack(y_all); groups=np.hstack(g_all)
-        _free_mem(X_all,y_all,g_all)
-        print(f"  X={X.shape}  |  RAM≈{X.nbytes/1e6:.1f} MB"); _print_ram("Tras carga")
-        return X,y,groups
+                keep=max_beats_total-total; X_f,Xraw_f,y_f=X_f[:keep],Xraw_f[:keep],y_f[:keep]
+            X_all.append(X_f); Xraw_all.append(Xraw_f); y_all.append(y_f)
+            g_all.append(np.full(len(y_f),rec)); total+=len(y_f)
+        X=np.vstack(X_all).astype(np.float32)
+        X_raw=np.vstack(Xraw_all).astype(np.float32)
+        y=np.hstack(y_all); groups=np.hstack(g_all)
+        _free_mem(X_all,Xraw_all,y_all,g_all)
+        print(f"  X={X.shape}  X_raw={X_raw.shape}  |  RAM≈{(X.nbytes+X_raw.nbytes)/1e6:.1f} MB"); _print_ram("Tras carga")
+        return X,X_raw,y,groups
 
     def _to_binary_chf(self, y_symbols):
         y = y_symbols.astype(str)
@@ -314,8 +466,19 @@ class CHFDetectionV12:
         _print_ram("after balance")
         return X_b.astype(np.float32), y_b.astype(np.int8), summary
 
-    def split_stratified(self, X, y01, test_size=0.2):
-        return train_test_split(X, y01, test_size=test_size, random_state=42, stratify=y01)
+    def split_stratified(self, X, y01, test_size=0.2, X_raw=None):
+        if X_raw is None:
+            return train_test_split(X, y01, test_size=test_size, random_state=42, stratify=y01)
+        return train_test_split(X, X_raw, y01, test_size=test_size, random_state=42, stratify=y01)
+
+    def smart_balance_raw(self, X_raw, y_bin):
+        y01 = np.where(y_bin=="Normal",0,1).astype(np.int8)
+        unique,counts = np.unique(y01,return_counts=True)
+        cap = {int(l):min(6000,int(c)) for l,c in zip(unique,counts)}
+        Xu,yu = RandomUnderSampler(sampling_strategy=cap,random_state=42).fit_resample(X_raw,y01)
+        Xb,yb = BorderlineSMOTE(random_state=42,k_neighbors=3).fit_resample(Xu,yu)
+        _free_mem(Xu,yu)
+        return Xb.astype(np.float32), yb.astype(np.int8)
 
     # ──────────────────────────────────────────────────────────────────────────
     #  LOSO
@@ -361,8 +524,8 @@ class CHFDetectionV12:
             entry = {"mean": float(np.mean(arr)), "std": float(np.std(arr)),
                      "min": float(np.min(arr)), "max": float(np.max(arr))}
             if k == "auc_roc":
-                # Some folds have only a sungle class in the test set and do not allow 
-                # compute AUC (the number of folds contributing ro the average is reported)
+                # Some folds have only a single class in the test set and do not allow 
+                # compute AUC (the number of folds contributing to the average is reported)
                 entry["n_valid_folds"] = len(arr)
             summary[k] = entry
         with open(self.paths.reports_dir/"loso_summary.json","w") as f:
@@ -386,6 +549,7 @@ class CHFDetectionV12:
     #  TRAINING
     # ──────────────────────────────────────────────────────────────────────────
     def train_models(self, X_train, y_train, X_test, y_test,
+                     Xraw_train=None, yraw_train=None, Xte_raw=None,
                      train_cnn=False, train_rocket=False, light_mode=False):
         _section("[4/5] Training + Evaluation ")
         Xtr=self.scaler.fit_transform(X_train); Xte=self.scaler.transform(X_test)
@@ -399,29 +563,70 @@ class CHFDetectionV12:
                 subsample=0.8,colsample_bytree=0.9,random_state=42,
                 eval_metric="logloss",tree_method="hist"),
         }
-        results={}; roc_data={}
+        results={}; roc_data={}; self.predictions={}
         for name,mdl in models_cfg.items():
             t0=time.time(); print(f"\n   {name}...", end="", flush=True)
             mdl.fit(Xtr,y_train)
             yp=mdl.predict(Xte); yprob=mdl.predict_proba(Xte)[:,1]
             m=_extended_metrics(y_test,yp,yprob); ci=_bootstrap_ci(y_test,yp,yprob)
             results[name]={**m,"ci95":ci}; self.models[name]=mdl; roc_data[name]=(y_test,yprob)
+            self.predictions[name]=yp
             with open(self.paths.models_dir/f"{name}_model.pkl","wb") as f: pickle.dump(mdl,f)
             auc_str=f"  auc={m['auc_roc']:.4f}" if m["auc_roc"] else ""
             print(f"\r  ✅ {name:<18}  acc={m['accuracy']:.4f}  f1={m['f1']:.4f}"
                   f"{auc_str}  mcc={m['mcc']:.4f}  spec={m['specificity']:.4f}  ({int(time.time()-t0)}s)")
             _print_ram()
-        if train_cnn and CNN_AVAILABLE:
-            res_cnn = self._train_cnn(Xtr,y_train,Xte,y_test,light_mode=light_mode)
-            if res_cnn: results["CNN"],roc_data["CNN"] = res_cnn
-        if train_rocket and ROCKET_AVAILABLE:
-            res_rkt = self._train_minirocket(Xtr,y_train,Xte,y_test)
-            if res_rkt: results["MiniRocket"],roc_data["MiniRocket"] = res_rkt
+
+        if train_cnn and CNN_AVAILABLE and Xraw_train is not None:
+            res_cnn = self._train_cnn(Xraw_train,yraw_train,Xte_raw,y_test,light_mode=light_mode)
+            if res_cnn:
+                results["CNN"],roc_data["CNN"] = res_cnn
+                self.predictions["CNN"]=(roc_data["CNN"][1] >= results["CNN"]["cnn_threshold"]).astype(int)
+        if train_rocket and ROCKET_AVAILABLE and Xraw_train is not None:
+            res_rkt = self._train_minirocket(Xraw_train,yraw_train,Xte_raw,y_test)
+            if res_rkt:
+                results["MiniRocket"],roc_data["MiniRocket"] = res_rkt
+                self.predictions["MiniRocket"]=self._last_minirocket_pred
         self.results=results
         with open(self.paths.run_dir/"scaler.pkl","wb") as f: pickle.dump(self.scaler,f)
-        self._plot_confusions(Xte,y_test)
+        self._plot_confusions(Xte,y_test,Xte_raw=Xte_raw)
         self._plot_roc_curves(roc_data)
+        self._compute_mcnemar_tests(y_test)
         return results
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  STATISTICAL SIGNIFICANCE (McNemar)
+    # ──────────────────────────────────────────────────────────────────────────
+    def _compute_mcnemar_tests(self, y_test, reference_model="XGBoost"):
+        from scipy.stats import chi2
+        if reference_model not in self.predictions:
+            print(f"  ⚠️  McNemar: '{reference_model}' not found among trained models, skipping."); return None
+        y_test = np.asarray(y_test)
+        ref_pred = np.asarray(self.predictions[reference_model])
+        rows = []
+        print(f"\n  McNemar's test vs. {reference_model} (continuity correction, n={len(y_test)}):")
+        for name, pred in self.predictions.items():
+            if name == reference_model: continue
+            pred = np.asarray(pred)
+            correct_ref = (ref_pred == y_test); correct_other = (pred == y_test)
+            b = int(np.sum(correct_ref & ~correct_other))   # ref right, other wrong
+            c = int(np.sum(~correct_ref & correct_other))   # ref wrong, other right
+            n_discordant = b + c
+            if n_discordant == 0:
+                stat, p = 0.0, 1.0
+            else:
+                stat = (abs(b - c) - 1) ** 2 / n_discordant
+                p = float(1 - chi2.cdf(stat, df=1))
+            sig = "significant" if p < 0.05 else "NOT significant"
+            rows.append({"model_a": reference_model, "model_b": name, "b_discordant": b,
+                         "c_discordant": c, "n_discordant": n_discordant,
+                         "chi2": round(float(stat), 4), "p_value": p, "significant_p<0.05": p < 0.05})
+            print(f"    {reference_model} vs {name:<18} chi2={stat:7.3f}  p={p:.5g}  ({sig})")
+        df = pd.DataFrame(rows)
+        out_path = self.paths.reports_dir / "mcnemar_results.csv"
+        df.to_csv(out_path, index=False)
+        print(f"  📄 McNemar report: {out_path}")
+        return df
 
     def _train_cnn(self, Xtr, ytr, Xte, yte, light_mode=False):
         Xtr_c=Xtr.reshape(Xtr.shape[0],Xtr.shape[1],1)
@@ -474,13 +679,14 @@ class CHFDetectionV12:
         with open(self.paths.models_dir/"MiniRocket_model.pkl","wb") as f:
             pickle.dump({"transformer":rocket,"classifier":clf},f)
         self.models["MiniRocket"]={"transformer":rocket,"classifier":clf}
+        self._last_minirocket_pred = yp
         print(f"  ✅ MiniRocket  acc={m['accuracy']:.4f}  f1={m['f1']:.4f}  mcc={m['mcc']:.4f}")
         return {**m,"ci95":ci},(yte,yprob)
 
     # ──────────────────────────────────────────────────────────────────────────
     #   MeTRIC PLOTS (Matrices + ROC)
     # ──────────────────────────────────────────────────────────────────────────
-    def _plot_confusions(self, Xte_scaled, y_test):
+    def _plot_confusions(self, Xte_scaled, y_test, Xte_raw=None):
         names=list(self.models.keys()); cols=min(3,len(names)); rows=(len(names)+cols-1)//cols
         fig,axes=plt.subplots(rows,cols,figsize=(5*cols,4*rows))
         fig.suptitle("Confusion Matrices\n0=Normal · 1=CHF-morphology",fontsize=11)
@@ -495,11 +701,12 @@ class CHFDetectionV12:
                 if idx>=len(names): ax.axis("off"); idx+=1; continue
                 name=names[idx]; mdl=self.models[name]
                 try:
+
                     if name=="CNN":
-                        Xc=Xte_scaled.reshape(Xte_scaled.shape[0],Xte_scaled.shape[1],1)
+                        Xc=Xte_raw.reshape(Xte_raw.shape[0],Xte_raw.shape[1],1)
                         pr=mdl.predict(Xc,verbose=0)[:,1]; yp=(pr>=cnn_thr).astype(int)
                     elif name=="MiniRocket":
-                        Xr=Xte_scaled.reshape(Xte_scaled.shape[0],1,Xte_scaled.shape[1])
+                        Xr=Xte_raw.reshape(Xte_raw.shape[0],1,Xte_raw.shape[1])
                         Zt=mdl["transformer"].transform(Xr); yp=mdl["classifier"].predict(Zt)
                     else: yp=mdl.predict(Xte_scaled)
                     cm=confusion_matrix(y_test,yp); cmn=cm.astype(float)/(cm.sum(axis=1,keepdims=True)+1e-8)
@@ -766,10 +973,8 @@ class CHFDetectionV12:
         for rec_name in self.list_records()[:8]:
             try:
                 rec,ann = self._load_record(rec_name)
-                sig_raw = rec.p_signal[:,0]
-                mn,mx   = sig_raw.min(),sig_raw.max()
-                sig     = 2*(sig_raw-mn)/(mx-mn+1e-8)-1
-                sig_f   = _bandpass_sig(sig,self.fs)
+
+                sig_f   = self.preprocess_signal(rec.p_signal)[:,0]
                 for peak,lab in zip(ann.sample,ann.symbol):
                     if lab.upper()=="N": continue
                     s,e = peak-self.half, peak+self.half
@@ -847,11 +1052,11 @@ class CHFDetectionV12:
         for rec_name in self.list_records()[:6]:
             try:
                 rec,ann=self._load_record(rec_name)
-                sig=_bandpass_sig(rec.p_signal[:,0],self.fs)
+                sig=self.preprocess_signal(rec.p_signal)[:,0]
                 for peak,lab in zip(ann.sample,ann.symbol):
                     s,e=peak-self.half,peak+self.half
                     if s<0 or e>=len(sig): continue
-                    beat=sig[s:e]; beat=(beat-beat.mean())/(beat.std()+1e-8)
+                    beat=sig[s:e]
                     if lab.upper()=="N" and normal_seg is None: normal_seg=beat.copy()
                     elif lab.upper()!="N" and chf_seg is None: chf_seg=beat.copy()
                 if normal_seg is not None and chf_seg is not None: break
@@ -954,7 +1159,7 @@ class CHFDetectionV12:
 
         self.cache_features_per_record(max_records=max_records,
                                        max_beats_per_record=max_beats_per_record)
-        X,y_symbols,groups = self.load_cached_dataset(max_beats_total=max_beats_total)
+        X,X_raw,y_symbols,groups = self.load_cached_dataset(max_beats_total=max_beats_total)
 
         y_bin = self._to_binary_chf(y_symbols)
         y01   = np.where(y_bin=="Normal",0,1).astype(np.int8)
@@ -966,15 +1171,17 @@ class CHFDetectionV12:
         _free_mem(groups)
 
         _section("[3/5] Split + Balanceo  (random_state=42)")
-        Xtr,Xte,ytr,yte=self.split_stratified(X,y01)
-        _free_mem(X,y01)
+        Xtr,Xraw_tr,Xte,Xraw_te,ytr,yte=self.split_stratified(X,y01,X_raw=X_raw)
+        _free_mem(X,X_raw,y01)
 
         Xb,yb,summ=self.smart_balance_binary(Xtr,np.where(ytr==0,"Normal","CHF-morphology"))
+        Xraw_b,yraw_b=self.smart_balance_raw(Xraw_tr,np.where(ytr==0,"Normal","CHF-morphology"))
         np.savez(self.paths.run_dir/"features_before_balance.npz",X=Xtr,y=ytr)
         np.savez(self.paths.run_dir/"features_after_balance.npz",X=Xb,y=yb)
-        _free_mem(Xtr,ytr)
+        np.savez(self.paths.run_dir/"raw_after_balance.npz",X=Xraw_b,y=yraw_b)
+        _free_mem(Xtr,ytr,Xraw_tr)
 
-        results=self.train_models(Xb,yb,Xte,yte,
+        results=self.train_models(Xb,yb,Xte,yte,Xraw_b,yraw_b,Xraw_te,
                                   train_cnn=train_cnn,train_rocket=train_rocket,
                                   light_mode=light_mode)
         _free_mem(Xb,yb)
@@ -1023,9 +1230,10 @@ class CHFDetectionV12:
         print("  3)   Full     (todos, 50k, NO LOSO) ")
         print("  4)   Full + LOSO  ")
         print("  5)   Exit")
+        print("  6)   Validar Pan-Tompkins vs anotaciones WFDB (no entrena modelos)")
         print("─"*62)
         _print_ram("Before Running")
-        choice=input("\n   option [1-5]: ").strip()
+        choice=input("\n   option [1-6]: ").strip()
         if choice=="1":
             return self.run_pipeline(max_records=2,max_beats_per_record=800,
                 max_beats_total=5000,light_mode=True)
@@ -1039,6 +1247,8 @@ class CHFDetectionV12:
         if choice=="4":
             return self.run_pipeline(max_beats_per_record=2000,max_beats_total=50000,
                 run_loso=True,train_cnn=CNN_AVAILABLE,train_rocket=ROCKET_AVAILABLE)
+        if choice=="6":
+            return self.validate_pan_tompkins_detection()
         print("  Exiting...")
         return None
 
