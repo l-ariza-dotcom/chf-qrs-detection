@@ -1,7 +1,6 @@
 # chf_detection.py
 # Autor: Ing. Adriel Lariza Lozada Romero
-# Beat-level CHF Morphology Detection — v12
-#
+# Beat-level CHF Morphology Detection — v12.1
 #
 # REQUIREMENTS
 #   Run first: python setup.py
@@ -57,6 +56,12 @@ try:
     from sktime.transformations.panel.rocket import MiniRocket
     from sklearn.linear_model import RidgeClassifier
     ROCKET_AVAILABLE = True
+except Exception:
+    pass
+SHAP_AVAILABLE = False
+try:
+    import shap
+    SHAP_AVAILABLE = True
 except Exception:
     pass
 
@@ -190,6 +195,17 @@ class CHFDetectionV12:
             "Max_Derivative","Min_Derivative",
             "Total_Variation","Inflection_Points",
         ]
+
+        self.feature_domains = {
+            "Mean_Amplitude":"Temporal","Std_Amplitude":"Temporal","Skewness":"Temporal",
+            "Kurtosis":"Temporal","Max_Amplitude":"Temporal","Min_Amplitude":"Temporal",
+            "Peak_to_Peak":"Temporal",
+            "Spectral_Mean":"Spectral","Spectral_Std":"Spectral","Spectral_Max":"Spectral",
+            "Low_Freq_Power":"Spectral","High_Freq_Power":"Spectral",
+            "Positive_Derivatives":"Morphological","Negative_Derivatives":"Morphological",
+            "Max_Derivative":"Morphological","Min_Derivative":"Morphological",
+            "Total_Variation":"Morphological","Inflection_Points":"Morphological",
+        }
         print("\n"+"═"*62)
         print("    CHF DETECTION v12")
         print("═"*62)
@@ -255,7 +271,7 @@ class CHFDetectionV12:
                 rec,ann = self._load_record(r)
                 sig = self.preprocess_signal(rec.p_signal)
                 del rec; gc.collect()
-                half = self.half; X_list,y_list = [],[]
+                half = self.half; X_list,y_list,raw_list = [],[],[]
                 for peak,lab in zip(ann.sample,ann.symbol):
                     if len(X_list)>=max_beats_per_record: break
                     s,e = peak-half, peak+half
@@ -263,11 +279,13 @@ class CHFDetectionV12:
                     beat = sig[s:e,0]
                     if len(beat)!=self.window_size: continue
                     X_list.append(self._extract_features(beat)); y_list.append(lab)
+                    raw_list.append(beat.astype(np.float32))
                 _free_mem(sig)
                 if not X_list: print("    no beats"); continue
                 np.savez_compressed(npz, X=np.vstack(X_list).astype(np.float32),
+                                    X_raw=np.vstack(raw_list).astype(np.float32),
                                     y=np.array(y_list), record=r)
-                _free_mem(X_list, y_list)
+                _free_mem(X_list, y_list, raw_list)
                 print(f"  ✅ {len(y_list)} beats"); _print_ram()
             except Exception as e:
                 print(f"\n    ⚠️  {e}"); gc.collect()
@@ -277,18 +295,28 @@ class CHFDetectionV12:
         files = sorted(self.paths.cache_dir.glob("*_features.npz"))
         if not files: raise FileNotFoundError("Sin cache.")
         _section(f"[2/5] loading dataset — {len(files)} records")
-        X_all,y_all,g_all = [],[],[]
+        X_all,Xraw_all,y_all,g_all = [],[],[],[]
         total = 0
         for f in files:
             if max_beats_total and total>=max_beats_total: break
-            d=np.load(f,allow_pickle=True); X_f=d["X"].astype(np.float32); y_f=d["y"]; rec=str(d["record"]); d.close()
+            d=np.load(f,allow_pickle=True)
+            if "X_raw" not in d.files:
+                raise KeyError(
+                    f"{f.name} was cached with an older version of this script and has no "
+                    f"'X_raw' array (raw 300-sample beat). Delete the cache_records folder "
+                    f"and re-run cache_features_per_record() to regenerate it."
+                )
+            X_f=d["X"].astype(np.float32); Xraw_f=d["X_raw"].astype(np.float32)
+            y_f=d["y"]; rec=str(d["record"]); d.close()
             if max_beats_total and total+len(X_f)>max_beats_total:
-                keep=max_beats_total-total; X_f,y_f=X_f[:keep],y_f[:keep]
-            X_all.append(X_f); y_all.append(y_f); g_all.append(np.full(len(y_f),rec)); total+=len(y_f)
-        X=np.vstack(X_all).astype(np.float32); y=np.hstack(y_all); groups=np.hstack(g_all)
-        _free_mem(X_all,y_all,g_all)
-        print(f"  X={X.shape}  |  RAM≈{X.nbytes/1e6:.1f} MB"); _print_ram("Tras carga")
-        return X,y,groups
+                keep=max_beats_total-total; X_f,Xraw_f,y_f=X_f[:keep],Xraw_f[:keep],y_f[:keep]
+            X_all.append(X_f); Xraw_all.append(Xraw_f); y_all.append(y_f)
+            g_all.append(np.full(len(y_f),rec)); total+=len(y_f)
+        X=np.vstack(X_all).astype(np.float32); X_raw=np.vstack(Xraw_all).astype(np.float32)
+        y=np.hstack(y_all); groups=np.hstack(g_all)
+        _free_mem(X_all,Xraw_all,y_all,g_all)
+        print(f"  X={X.shape}  X_raw={X_raw.shape}  |  RAM≈{(X.nbytes+X_raw.nbytes)/1e6:.1f} MB"); _print_ram("Tras carga")
+        return X,X_raw,y,groups
 
     def _to_binary_chf(self, y_symbols):
         y = y_symbols.astype(str)
@@ -314,8 +342,24 @@ class CHFDetectionV12:
         _print_ram("after balance")
         return X_b.astype(np.float32), y_b.astype(np.int8), summary
 
-    def split_stratified(self, X, y01, test_size=0.2):
-        return train_test_split(X, y01, test_size=test_size, random_state=42, stratify=y01)
+    def split_stratified(self, X, y01, test_size=0.2, X_raw=None):
+        if X_raw is None:
+            return train_test_split(X, y01, test_size=test_size, random_state=42, stratify=y01)
+        Xtr,Xte,Xrawtr,Xrawte,ytr,yte = train_test_split(
+            X, X_raw, y01, test_size=test_size, random_state=42, stratify=y01)
+        return Xtr,Xte,Xrawtr,Xrawte,ytr,yte
+
+    def smart_balance_raw(self, X_raw, y_bin):
+        """Same RUS + BorderlineSMOTE strategy as smart_balance_binary, applied
+        directly to the raw 300-sample signal (used to train CNN and MiniRocket
+        on genuine raw-signal input instead of the 18-feature vector)."""
+        y01 = np.where(y_bin=="Normal",0,1).astype(np.int8)
+        unique,counts = np.unique(y01,return_counts=True)
+        cap = {int(l):min(6000,int(c)) for l,c in zip(unique,counts)}
+        Xr_u,y_u = RandomUnderSampler(sampling_strategy=cap,random_state=42).fit_resample(X_raw,y01)
+        Xr_b,y_b = BorderlineSMOTE(random_state=42,k_neighbors=3).fit_resample(Xr_u,y_u)
+        _free_mem(Xr_u,y_u)
+        return Xr_b.astype(np.float32), y_b.astype(np.int8)
 
     # ──────────────────────────────────────────────────────────────────────────
     #  LOSO
@@ -333,9 +377,9 @@ class CHFDetectionV12:
             Xb,yb,_ = self.smart_balance_binary(Xtr, np.where(ytr==0,"Normal","CHF-morphology"))
             sc = StandardScaler()
             Xtr_s=sc.fit_transform(Xb); Xte_s=sc.transform(Xte)
-            # Same hyperparameters as the main training (paper-reported values)
-            mdl = xgb.XGBClassifier(n_estimators=500,max_depth=5,learning_rate=0.1,
-                reg_lambda=1.0,reg_alpha=0.5,subsample=0.8,colsample_bytree=0.9,
+   
+            mdl = xgb.XGBClassifier(n_estimators=250,max_depth=5,learning_rate=0.08,
+                reg_lambda=1.0,reg_alpha=0.0,subsample=0.8,colsample_bytree=0.9,
                 random_state=42,eval_metric="logloss",tree_method="hist")
             mdl.fit(Xtr_s,yb)
             yp=mdl.predict(Xte_s); yprob=mdl.predict_proba(Xte_s)[:,1]
@@ -362,6 +406,7 @@ class CHFDetectionV12:
             entry = {"mean": float(np.mean(arr)), "std": float(np.std(arr)),
                      "min": float(np.min(arr)), "max": float(np.max(arr))}
             if k == "auc_roc":
+
                 entry["n_valid_folds"] = len(arr)
             summary[k] = entry
         with open(self.paths.reports_dir/"loso_summary.json","w") as f:
@@ -385,62 +430,130 @@ class CHFDetectionV12:
     #  TRAINING
     # ──────────────────────────────────────────────────────────────────────────
     def train_models(self, X_train, y_train, X_test, y_test,
+                     Xraw_train=None, yraw_train=None, Xte_raw=None,
                      train_cnn=False, train_rocket=False, light_mode=False):
         _section("[4/5] Training + Evaluation ")
         Xtr=self.scaler.fit_transform(X_train); Xte=self.scaler.transform(X_test)
+
         n_rf=100 if light_mode else 200
-        n_gb=100 if light_mode else 300
-        n_xgb=150 if light_mode else 500
+        n_gb=100 if light_mode else 200
+        n_xgb=150 if light_mode else 250
         models_cfg = {
             "RandomForest": RandomForestClassifier(n_estimators=n_rf,max_depth=10,
+                min_samples_split=5,max_samples=0.8,class_weight="balanced",
                 criterion="gini",random_state=42,n_jobs=-1),
-            "GradientBoosting": GradientBoostingClassifier(n_estimators=n_gb,learning_rate=0.05,
-                max_depth=5,subsample=0.8,random_state=42),
-            "XGBoost": xgb.XGBClassifier(n_estimators=n_xgb,max_depth=5,learning_rate=0.1,
-                reg_lambda=1.0,reg_alpha=0.5,subsample=0.8,colsample_bytree=0.9,
+            "GradientBoosting": GradientBoostingClassifier(n_estimators=n_gb,learning_rate=0.08,
+                max_depth=4,subsample=0.8,random_state=42),
+            "XGBoost": xgb.XGBClassifier(n_estimators=n_xgb,max_depth=5,learning_rate=0.08,
+                reg_lambda=1.0,reg_alpha=0.0,subsample=0.8,colsample_bytree=0.9,
                 random_state=42,eval_metric="logloss",tree_method="hist"),
         }
-        results={}; roc_data={}
+        results={}; roc_data={}; self.predictions={}
         for name,mdl in models_cfg.items():
             t0=time.time(); print(f"\n   {name}...", end="", flush=True)
             mdl.fit(Xtr,y_train)
             yp=mdl.predict(Xte); yprob=mdl.predict_proba(Xte)[:,1]
             m=_extended_metrics(y_test,yp,yprob); ci=_bootstrap_ci(y_test,yp,yprob)
             results[name]={**m,"ci95":ci}; self.models[name]=mdl; roc_data[name]=(y_test,yprob)
+            self.predictions[name]=yp
             with open(self.paths.models_dir/f"{name}_model.pkl","wb") as f: pickle.dump(mdl,f)
             auc_str=f"  auc={m['auc_roc']:.4f}" if m["auc_roc"] else ""
             print(f"\r  ✅ {name:<18}  acc={m['accuracy']:.4f}  f1={m['f1']:.4f}"
                   f"{auc_str}  mcc={m['mcc']:.4f}  spec={m['specificity']:.4f}  ({int(time.time()-t0)}s)")
             _print_ram()
-        if train_cnn and CNN_AVAILABLE:
-            res_cnn = self._train_cnn(Xtr,y_train,Xte,y_test,light_mode=light_mode)
-            if res_cnn: results["CNN"],roc_data["CNN"] = res_cnn
-        if train_rocket and ROCKET_AVAILABLE:
-            res_rkt = self._train_minirocket(Xtr,y_train,Xte,y_test)
-            if res_rkt: results["MiniRocket"],roc_data["MiniRocket"] = res_rkt
+        if train_cnn and CNN_AVAILABLE and Xraw_train is not None:
+            res_cnn = self._train_cnn(Xraw_train,yraw_train,Xte_raw,y_test,light_mode=light_mode)
+            if res_cnn:
+                results["CNN"],roc_data["CNN"] = res_cnn
+                self.predictions["CNN"] = self._last_cnn_pred
+        if train_rocket and ROCKET_AVAILABLE and Xraw_train is not None:
+            res_rkt = self._train_minirocket(Xraw_train,yraw_train,Xte_raw,y_test)
+            if res_rkt:
+                results["MiniRocket"],roc_data["MiniRocket"] = res_rkt
+                self.predictions["MiniRocket"] = self._last_minirocket_pred
         self.results=results
         with open(self.paths.run_dir/"scaler.pkl","wb") as f: pickle.dump(self.scaler,f)
-        self._plot_confusions(Xte,y_test)
+        self._plot_confusions(Xte,y_test,Xte_raw=Xte_raw)
         self._plot_roc_curves(roc_data)
+        if len(self.predictions) > 1:
+            self._compute_mcnemar_tests(y_test)
+        if SHAP_AVAILABLE and "XGBoost" in self.models:
+            self._compute_shap_analysis(Xte, y_test)
         return results
 
-    def _train_cnn(self, Xtr, ytr, Xte, yte, light_mode=False):
-        Xtr_c=Xtr.reshape(Xtr.shape[0],Xtr.shape[1],1)
-        Xte_c=Xte.reshape(Xte.shape[0],Xte.shape[1],1)
+    def _compute_shap_analysis(self, Xte_scaled, y_test, top_n=10):
+        print("\n  Computing SHAP analysis (XGBoost)...")
+        explainer = shap.TreeExplainer(self.models["XGBoost"])
+        shap_values = explainer.shap_values(Xte_scaled)
+        if isinstance(shap_values, list):  
+            shap_values = shap_values[1]
+        mean_abs = np.abs(shap_values).mean(axis=0)
+        order = np.argsort(mean_abs)[::-1]
+        rows = []
+        for rank, idx in enumerate(order, 1):
+            fname = self.feature_names[idx]
+            rows.append({
+                "rank": rank, "feature": fname,
+                "domain": self.feature_domains.get(fname, "Unknown"),
+                "mean_abs_shap": round(float(mean_abs[idx]), 5),
+            })
+        df = pd.DataFrame(rows)
+        out_path = self.paths.reports_dir / "shap_top_features.csv"
+        df.to_csv(out_path, index=False)
+        print(f"  Top {top_n} features by mean |SHAP|:")
+        for r in rows[:top_n]:
+            print(f"    {r['rank']:>2}. {r['feature']:<22} ({r['domain']:<13}) {r['mean_abs_shap']:.5f}")
+        print(f"  📄 {out_path}")
+        return df
+
+    def _compute_mcnemar_tests(self, y_test, reference_model="XGBoost"):
+
+        from scipy.stats import chi2
+        if reference_model not in self.predictions:
+            print(f"  ⚠️  McNemar: reference model '{reference_model}' not found, skipping."); return None
+        y_test = np.asarray(y_test)
+        y_ref = np.asarray(self.predictions[reference_model])
+        rows = []
+        for name, yp in self.predictions.items():
+            if name == reference_model: continue
+            yp = np.asarray(yp)
+            ref_correct = (y_ref == y_test)
+            other_correct = (yp == y_test)
+            b = int(np.sum(ref_correct & ~other_correct))  
+            c = int(np.sum(~ref_correct & other_correct)) 
+            n_discordant = b + c
+            if n_discordant == 0:
+                stat, p = 0.0, 1.0
+            else:
+                stat = (abs(b - c) - 1) ** 2 / n_discordant
+                p = 1 - chi2.cdf(stat, df=1)
+            rows.append({
+                "model_a": reference_model, "model_b": name,
+                "b_discordant": b, "c_discordant": c, "n_discordant": n_discordant,
+                "chi2": round(float(stat), 3), "p_value": float(p),
+                "significant_p<0.05": bool(p < 0.05),
+            })
+        df = pd.DataFrame(rows)
+        out_path = self.paths.reports_dir / "mcnemar_results.csv"
+        df.to_csv(out_path, index=False)
+        print(f"\n  McNemar's test ({reference_model} vs. others):")
+        for r in rows:
+            print(f"    {reference_model} vs {r['model_b']:<14} chi2={r['chi2']:.3f}  "
+                  f"p={r['p_value']:.4g}  significant={r['significant_p<0.05']}")
+        print(f"  📄 {out_path}")
+        return df
+
+    def _train_cnn(self, Xtr_raw, ytr, Xte_raw, yte, light_mode=False):
+        Xtr_c=Xtr_raw.reshape(Xtr_raw.shape[0],Xtr_raw.shape[1],1)
+        Xte_c=Xte_raw.reshape(Xte_raw.shape[0],Xte_raw.shape[1],1)
         ytr_cat=to_categorical(ytr,num_classes=2)
-        epochs=30 if light_mode else 50; batch=128 if light_mode else 64
+        epochs=20 if light_mode else 80; batch=64
         model=keras_models.Sequential([
-            layers.Conv1D(32,5,activation="relu",input_shape=(Xtr.shape[1],1)),
+            layers.Conv1D(64,5,activation="relu",input_shape=(Xtr_raw.shape[1],1)),
             layers.BatchNormalization(),
-            layers.MaxPooling1D(2),
-            layers.Conv1D(64,7,activation="relu"),
-            layers.BatchNormalization(),
-            layers.MaxPooling1D(2),
-            layers.Conv1D(128,5,activation="relu"),
+            layers.Conv1D(128,3,activation="relu"),
             layers.BatchNormalization(),
             layers.GlobalAveragePooling1D(),
-            layers.Dense(128,activation="relu"),
-            layers.Dropout(0.3),
             layers.Dense(64,activation="relu"),
             layers.Dropout(0.3),
             layers.Dense(2,activation="softmax"),
@@ -448,7 +561,7 @@ class CHFDetectionV12:
         model.compile(optimizer=tf.keras.optimizers.Adam(0.001),
                       loss="categorical_crossentropy",metrics=["accuracy"])
         es=EarlyStopping(monitor="val_accuracy",patience=10,restore_best_weights=True,verbose=0)
-        print("  Training CNN...")
+        print("  Training CNN (raw signal)...")
         hist=model.fit(Xtr_c,ytr_cat,validation_split=0.2,epochs=epochs,batch_size=batch,
                        callbacks=[es],verbose=1)
         self.training_histories["CNN"]=hist.history
@@ -458,6 +571,7 @@ class CHFDetectionV12:
             f1_t=f1_score(yte,(yprob>=thr).astype(int),average="weighted",zero_division=0)
             if f1_t>best_f1: best_f1,best_thr=f1_t,float(thr)
         yp=(yprob>=best_thr).astype(int)
+        self._last_cnn_pred = yp
         m=_extended_metrics(yte,yp,yprob); ci=_bootstrap_ci(yte,yp,yprob)
         try: model.save(self.paths.models_dir/"CNN_model.keras")
         except: model.save(str(self.paths.models_dir/"CNN_model.h5"))
@@ -466,13 +580,17 @@ class CHFDetectionV12:
               f"  auc={m['auc_roc']:.4f}  threshold={best_thr:.2f}")
         return {**m,"ci95":ci,"cnn_threshold":best_thr},(yte,yprob)
 
-    def _train_minirocket(self, Xtr, ytr, Xte, yte):
-        print("  Training MiniRocket...")
-        Xtr_r=Xtr.reshape(Xtr.shape[0],1,Xtr.shape[1]); Xte_r=Xte.reshape(Xte.shape[0],1,Xte.shape[1])
-        rocket=MiniRocket(num_kernels=10000,random_state=42); rocket.fit(Xtr_r)
+    def _train_minirocket(self, Xtr_raw, ytr, Xte_raw, yte):
+        print("  Training MiniRocket (raw signal)...")
+        Xtr_r=Xtr_raw.reshape(Xtr_raw.shape[0],1,Xtr_raw.shape[1])
+        Xte_r=Xte_raw.reshape(Xte_raw.shape[0],1,Xte_raw.shape[1])
+        rocket=MiniRocket(num_kernels=1000,random_state=42); rocket.fit(Xtr_r)
         Ztr=rocket.transform(Xtr_r); Zte=rocket.transform(Xte_r)
-        clf=RidgeClassifier(alpha=1.0); clf.fit(Ztr,ytr)
+        from sklearn.linear_model import RidgeClassifierCV
+        alphas=np.logspace(-3,3,13)
+        clf=RidgeClassifierCV(alphas=alphas); clf.fit(Ztr,ytr)
         yp=clf.predict(Zte)
+        self._last_minirocket_pred = yp
         try:
             raw=clf.decision_function(Zte); yprob=(raw-raw.min())/(raw.max()-raw.min()+1e-8)
         except: yprob=None
@@ -487,7 +605,7 @@ class CHFDetectionV12:
     # ──────────────────────────────────────────────────────────────────────────
     #   MeTRIC PLOTS (Matrices + ROC)
     # ──────────────────────────────────────────────────────────────────────────
-    def _plot_confusions(self, Xte_scaled, y_test):
+    def _plot_confusions(self, Xte_scaled, y_test, Xte_raw=None):
         names=list(self.models.keys()); cols=min(3,len(names)); rows=(len(names)+cols-1)//cols
         fig,axes=plt.subplots(rows,cols,figsize=(5*cols,4*rows))
         fig.suptitle("Confusion Matrices\n0=Normal · 1=CHF-morphology",fontsize=11)
@@ -503,10 +621,10 @@ class CHFDetectionV12:
                 name=names[idx]; mdl=self.models[name]
                 try:
                     if name=="CNN":
-                        Xc=Xte_scaled.reshape(Xte_scaled.shape[0],Xte_scaled.shape[1],1)
+                        Xc=Xte_raw.reshape(Xte_raw.shape[0],Xte_raw.shape[1],1)
                         pr=mdl.predict(Xc,verbose=0)[:,1]; yp=(pr>=cnn_thr).astype(int)
                     elif name=="MiniRocket":
-                        Xr=Xte_scaled.reshape(Xte_scaled.shape[0],1,Xte_scaled.shape[1])
+                        Xr=Xte_raw.reshape(Xte_raw.shape[0],1,Xte_raw.shape[1])
                         Zt=mdl["transformer"].transform(Xr); yp=mdl["classifier"].predict(Zt)
                     else: yp=mdl.predict(Xte_scaled)
                     cm=confusion_matrix(y_test,yp); cmn=cm.astype(float)/(cm.sum(axis=1,keepdims=True)+1e-8)
@@ -773,10 +891,7 @@ class CHFDetectionV12:
         for rec_name in self.list_records()[:8]:
             try:
                 rec,ann = self._load_record(rec_name)
-                sig_raw = rec.p_signal[:,0]
-                mn,mx   = sig_raw.min(),sig_raw.max()
-                sig     = 2*(sig_raw-mn)/(mx-mn+1e-8)-1
-                sig_f   = _bandpass_sig(sig,self.fs)
+                sig_f   = self.preprocess_signal(rec.p_signal)[:,0]
                 for peak,lab in zip(ann.sample,ann.symbol):
                     if lab.upper()=="N": continue
                     s,e = peak-self.half, peak+self.half
@@ -854,11 +969,11 @@ class CHFDetectionV12:
         for rec_name in self.list_records()[:6]:
             try:
                 rec,ann=self._load_record(rec_name)
-                sig=_bandpass_sig(rec.p_signal[:,0],self.fs)
+                sig=self.preprocess_signal(rec.p_signal)[:,0]
                 for peak,lab in zip(ann.sample,ann.symbol):
                     s,e=peak-self.half,peak+self.half
                     if s<0 or e>=len(sig): continue
-                    beat=sig[s:e]; beat=(beat-beat.mean())/(beat.std()+1e-8)
+                    beat=sig[s:e]
                     if lab.upper()=="N" and normal_seg is None: normal_seg=beat.copy()
                     elif lab.upper()!="N" and chf_seg is None: chf_seg=beat.copy()
                 if normal_seg is not None and chf_seg is not None: break
@@ -907,6 +1022,7 @@ class CHFDetectionV12:
         print(f"  📄 metrics: {csv_path}")
 
         repro = {
+            
             "random_state_global": 42,
             "label_0": "Normal sinus beat (annotation symbol N)",
             "label_1": "CHF-associated morphology (any symbol != N)",
@@ -923,28 +1039,31 @@ class CHFDetectionV12:
             "bootstrap_ci_alpha": 0.95,
             "hyperparameters": {
                 "XGBoost": {
-                    "n_estimators": 500, "max_depth": 5, "learning_rate": 0.1,
-                    "reg_lambda": 1.0, "reg_alpha": 0.5,
-                    "subsample": 0.8, "colsample_bytree": 0.9, "tree_method": "hist",
-                    "random_state": 42
+                    "n_estimators": 250, "max_depth": 5, "learning_rate": 0.08,
+                    "subsample": 0.8, "colsample_bytree": 0.9,
+                    "reg_lambda": 1.0, "reg_alpha": 0.0,
+                    "tree_method": "hist", "random_state": 42
                 },
                 "RandomForest": {
                     "n_estimators": 200, "max_depth": 10,
-                    "criterion": "gini", "random_state": 42
+                    "min_samples_split": 5, "max_samples": 0.8,
+                    "class_weight": "balanced", "random_state": 42
                 },
                 "GradientBoosting": {
-                    "n_estimators": 300, "learning_rate": 0.05,
-                    "max_depth": 5, "subsample": 0.8, "random_state": 42
+                    "n_estimators": 200, "learning_rate": 0.08,
+                    "max_depth": 4, "subsample": 0.8, "random_state": 42
                 },
-                "MiniRocket": {"num_kernels": 10000, "random_state": 42,
-                               "classifier": "RidgeClassifier(alpha=1.0)"},
+                "MiniRocket": {"num_kernels": 1000, "random_state": 42,
+                               "classifier": "RidgeClassifierCV, alpha selected via internal CV"},
                 "CNN": {
-                    "architecture": "Conv1D(32,5)->BN->MaxPool->Conv1D(64,7)->BN->MaxPool->Conv1D(128,5)->BN->GAP->Dense(128)->Dropout(0.3)->Dense(64)->Dropout(0.3)->Dense(2)",
+                    "architecture": "Conv1D(64,5)->BN->Conv1D(128,3)->BN->GAP->Dense(64)->Dropout(0.3)->Dense(2)",
                     "optimizer": "Adam(lr=0.001)",
                     "loss": "categorical_crossentropy",
-                    "epochs": 50,
+                    "epochs": 80,
                     "batch_size": 64,
                     "dropout": 0.3,
+                    "early_stopping_patience": 10,
+                    "monitor": "val_accuracy",
                     "threshold": "calibrated to maximize weighted-F1 (search 0.1-0.9)"
                 },
                 "LOSO_model": "XGBoost with same hyperparameters as above"
@@ -964,7 +1083,7 @@ class CHFDetectionV12:
 
         self.cache_features_per_record(max_records=max_records,
                                        max_beats_per_record=max_beats_per_record)
-        X,y_symbols,groups = self.load_cached_dataset(max_beats_total=max_beats_total)
+        X,X_raw,y_symbols,groups = self.load_cached_dataset(max_beats_total=max_beats_total)
 
         y_bin = self._to_binary_chf(y_symbols)
         y01   = np.where(y_bin=="Normal",0,1).astype(np.int8)
@@ -976,15 +1095,21 @@ class CHFDetectionV12:
         _free_mem(groups)
 
         _section("[3/5] Split + Balanceo  (random_state=42)")
-        Xtr,Xte,ytr,yte=self.split_stratified(X,y01)
-        _free_mem(X,y01)
+        Xtr,Xte,Xraw_tr,Xraw_te,ytr,yte=self.split_stratified(X,y01,X_raw=X_raw)
+        _free_mem(X,y01,X_raw)
 
         Xb,yb,summ=self.smart_balance_binary(Xtr,np.where(ytr==0,"Normal","CHF-morphology"))
         np.savez(self.paths.run_dir/"features_before_balance.npz",X=Xtr,y=ytr)
         np.savez(self.paths.run_dir/"features_after_balance.npz",X=Xb,y=yb)
-        _free_mem(Xtr,ytr)
+
+        Xraw_b = yraw_b = None
+        if (train_cnn and CNN_AVAILABLE) or (train_rocket and ROCKET_AVAILABLE):
+            Xraw_b,yraw_b = self.smart_balance_raw(Xraw_tr,np.where(ytr==0,"Normal","CHF-morphology"))
+            np.savez(self.paths.run_dir/"raw_after_balance.npz",X_raw=Xraw_b,y=yraw_b)
+        _free_mem(Xtr,ytr,Xraw_tr)
 
         results=self.train_models(Xb,yb,Xte,yte,
+                                  Xraw_train=Xraw_b,yraw_train=yraw_b,Xte_raw=Xraw_te,
                                   train_cnn=train_cnn,train_rocket=train_rocket,
                                   light_mode=light_mode)
         _free_mem(Xb,yb)
