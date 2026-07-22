@@ -1,0 +1,17 @@
+# requirements.txt — Beat-level CHF Morphology Detection (v12.1)
+# Pinned versions match those reported in the paper (Section: Reproducibility and
+# Computational Environment) and used to generate all results, figures, and reports.
+# Python 3.12
+
+numpy==2.2.5
+scipy==1.15.3
+pandas==2.2.3
+matplotlib==3.9.2
+scikit-learn==1.6.1
+imbalanced-learn==0.13.0
+xgboost==2.1.4
+tensorflow==2.19.0
+sktime==0.37.0
+shap==0.47.2
+wfdb==4.1.2
+psutil==6.1.0
